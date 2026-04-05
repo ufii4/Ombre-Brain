@@ -21,6 +21,7 @@ import subprocess
 import sys
 import logging
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Optional
 
@@ -161,7 +162,51 @@ def _parse_json_array(raw: str) -> list[dict]:
         return []
 
 
-# ── Process conversations ────────────────────────────────────
+# ── Process conversations ──────────────────────���─────────────
+
+async def save_items(
+    items: list[dict],
+    conv_ts: str,
+    dehydrator: Dehydrator,
+    bucket_mgr: BucketManager,
+    config: dict,
+    stats: dict,
+):
+    """Save digest results to buckets (merge-or-create). Must run sequentially."""
+    for item in items:
+        try:
+            existing = await bucket_mgr.search(item.get("content", ""), limit=1)
+            if existing and existing[0].get("score", 0) > config.get("merge_threshold", 75):
+                bucket = existing[0]
+                merged_content = await dehydrator.merge(bucket["content"], item["content"])
+                await bucket_mgr.update(
+                    bucket["id"],
+                    content=merged_content,
+                    tags=list(set(bucket["metadata"].get("tags", []) + item.get("tags", []))),
+                    importance=max(bucket["metadata"].get("importance", 5), item.get("importance", 5)),
+                    domain=list(set(bucket["metadata"].get("domain", []) + item.get("domain", []))),
+                    valence=item.get("valence", 0.5),
+                    arousal=item.get("arousal", 0.3),
+                )
+                stats["merged"] += 1
+                logger.info(f"    merged → {bucket['metadata'].get('name', bucket['id'])}")
+            else:
+                await bucket_mgr.create(
+                    content=item.get("content", ""),
+                    tags=item.get("tags", []),
+                    importance=item.get("importance", 5),
+                    domain=item.get("domain", []),
+                    valence=item.get("valence", 0.5),
+                    arousal=item.get("arousal", 0.3),
+                    name=item.get("name", ""),
+                    created=conv_ts,
+                    last_active=conv_ts,
+                )
+                stats["created"] += 1
+                logger.info(f"    + {item.get('name', '?')} (V{item.get('valence', 0.5):.1f}/A{item.get('arousal', 0.3):.1f})")
+        except Exception as e:
+            logger.warning(f"    entry failed: {e}")
+
 
 async def process_db(
     db_path: str,
@@ -171,12 +216,14 @@ async def process_db(
     bucket_mgr: BucketManager,
     config: dict,
     batch_size: int,
+    workers: int,
     session_filter: Optional[str],
     dry_run: bool,
 ) -> dict:
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
 
+    # Latest conversations first
     query = "SELECT * FROM conversations WHERE status = 'pending'"
     params = []
     if session_filter:
@@ -188,15 +235,16 @@ async def process_db(
     rows = conn.execute(query, params).fetchall()
     total_pending = conn.execute("SELECT COUNT(*) FROM conversations WHERE status = 'pending'").fetchone()[0]
 
-    logger.info(f"Pending: {total_pending}, processing batch: {len(rows)}")
+    logger.info(f"Pending: {total_pending}, processing batch: {len(rows)}, workers: {workers}")
 
     stats = {"processed": 0, "created": 0, "merged": 0, "failed": 0}
+    loop = asyncio.get_event_loop()
+    executor = ThreadPoolExecutor(max_workers=workers) if provider == "claude-cli" else None
 
     for row in rows:
         label = row["name"] or row["project"] or row["id"][:8]
         conv_ts = row["created_at"]
 
-        # Build transcript from messages table
         msg_rows = conn.execute(
             "SELECT role, content FROM messages WHERE conversation_id = ? ORDER BY position",
             (row["id"],)
@@ -217,60 +265,50 @@ async def process_db(
             stats["processed"] += 1
             continue
 
+        # Digest all chunks — parallel for claude-cli, async for openai
+        chunk_results = []  # list of (chunk_index, items_or_error)
         chunk_failed = False
-        for i, chunk in enumerate(chunks):
-            try:
-                if provider == "claude-cli":
-                    items = digest_with_claude_cli(chunk, model=model)
-                else:
-                    # Call API directly with our conversation prompt
-                    # (dehydrator.digest uses DIGEST_PROMPT which is
-                    # designed for diary entries, not conversations)
-                    items = await digest_with_api(chunk, dehydrator)
 
-                if not items:
-                    continue
+        if provider == "claude-cli" and workers > 1:
+            # Parallel: run claude-cli calls in thread pool
+            futures = []
+            for i, chunk in enumerate(chunks):
+                future = loop.run_in_executor(
+                    executor, digest_with_claude_cli, chunk, model
+                )
+                futures.append((i, future))
 
-                for item in items:
-                    try:
-                        existing = await bucket_mgr.search(item.get("content", ""), limit=1)
-                        if existing and existing[0].get("score", 0) > config.get("merge_threshold", 75):
-                            bucket = existing[0]
-                            merged_content = await dehydrator.merge(bucket["content"], item["content"])
-                            await bucket_mgr.update(
-                                bucket["id"],
-                                content=merged_content,
-                                tags=list(set(bucket["metadata"].get("tags", []) + item.get("tags", []))),
-                                importance=max(bucket["metadata"].get("importance", 5), item.get("importance", 5)),
-                                domain=list(set(bucket["metadata"].get("domain", []) + item.get("domain", []))),
-                                valence=item.get("valence", 0.5),
-                                arousal=item.get("arousal", 0.3),
-                            )
-                            stats["merged"] += 1
-                            logger.info(f"    merged → {bucket['metadata'].get('name', bucket['id'])}")
-                        else:
-                            await bucket_mgr.create(
-                                content=item.get("content", ""),
-                                tags=item.get("tags", []),
-                                importance=item.get("importance", 5),
-                                domain=item.get("domain", []),
-                                valence=item.get("valence", 0.5),
-                                arousal=item.get("arousal", 0.3),
-                                name=item.get("name", ""),
-                                created=conv_ts,
-                                last_active=conv_ts,
-                            )
-                            stats["created"] += 1
-                            logger.info(f"    + {item.get('name', '?')} (V{item.get('valence', 0.5):.1f}/A{item.get('arousal', 0.3):.1f})")
-                    except Exception as e:
-                        logger.warning(f"    entry failed: {e}")
+            for i, future in futures:
+                try:
+                    items = await future
+                    if items:
+                        chunk_results.append(items)
+                except subprocess.TimeoutExpired:
+                    logger.warning(f"    chunk {i+1} timed out")
+                    chunk_failed = True
+                except Exception as e:
+                    logger.error(f"    chunk {i+1} failed: {e}")
+                    chunk_failed = True
+        else:
+            # Sequential
+            for i, chunk in enumerate(chunks):
+                try:
+                    if provider == "claude-cli":
+                        items = digest_with_claude_cli(chunk, model=model)
+                    else:
+                        items = await digest_with_api(chunk, dehydrator)
+                    if items:
+                        chunk_results.append(items)
+                except subprocess.TimeoutExpired:
+                    logger.warning(f"    chunk {i+1} timed out")
+                    chunk_failed = True
+                except Exception as e:
+                    logger.error(f"    chunk {i+1} failed: {e}")
+                    chunk_failed = True
 
-            except subprocess.TimeoutExpired:
-                logger.warning(f"    chunk {i+1} timed out")
-                chunk_failed = True
-            except Exception as e:
-                logger.error(f"    chunk {i+1} failed: {e}")
-                chunk_failed = True
+        # Save all results sequentially (touches shared filesystem)
+        for items in chunk_results:
+            await save_items(items, conv_ts, dehydrator, bucket_mgr, config, stats)
 
         status = "failed" if chunk_failed else "processed"
         conn.execute(
@@ -282,6 +320,8 @@ async def process_db(
         if chunk_failed:
             stats["failed"] += 1
 
+    if executor:
+        executor.shutdown(wait=False)
     conn.close()
     return stats
 
@@ -296,6 +336,7 @@ async def main():
     parser.add_argument("--provider", choices=["openai", "claude-cli"], default="openai")
     parser.add_argument("--model", default=None, help="Model override")
     parser.add_argument("--batch", type=int, default=50, help="Conversations per run (default: 50)")
+    parser.add_argument("--workers", type=int, default=4, help="Parallel claude-cli workers (default: 4)")
     parser.add_argument("--session", default=None, help="Filter by conversation ID")
     parser.add_argument("--output-dir", default=None, help="Bucket output directory")
     parser.add_argument("--dry-run", action="store_true")
@@ -328,7 +369,7 @@ async def main():
     stats = await process_db(
         args.db, args.provider, args.model,
         dehydrator, bucket_mgr, config,
-        args.batch, args.session, args.dry_run,
+        args.batch, args.workers, args.session, args.dry_run,
     )
 
     logger.info(

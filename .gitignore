@@ -11,3 +11,4 @@ buckets/archive/
 buckets/permanent/
 scarp_paper
 *.db
+.idea/
