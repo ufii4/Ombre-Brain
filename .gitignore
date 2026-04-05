@@ -10,3 +10,4 @@ buckets/dynamic/
 buckets/archive/
 buckets/permanent/
 scarp_paper
+*.db

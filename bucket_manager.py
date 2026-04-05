@@ -106,10 +106,15 @@ class BucketManager:
         arousal: float = 0.3,
         bucket_type: str = "dynamic",
         name: str = None,
+        created: str = None,
+        last_active: str = None,
     ) -> str:
         """
         Create a new memory bucket, return bucket ID.
         创建一个新的记忆桶，返回桶 ID。
+
+        created/last_active: optional ISO timestamp overrides (for bootstrapping
+        historical data). Defaults to now.
         """
         bucket_id = generate_bucket_id()
         bucket_name = sanitize_name(name) if name else bucket_id
@@ -127,8 +132,8 @@ class BucketManager:
             "arousal": max(0.0, min(1.0, arousal)),
             "importance": max(1, min(10, importance)),
             "type": bucket_type,
-            "created": now_iso(),
-            "last_active": now_iso(),
+            "created": created or now_iso(),
+            "last_active": last_active or now_iso(),
             "activation_count": 1,
         }
 
